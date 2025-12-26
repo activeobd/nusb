@@ -1,3 +1,9 @@
+# This fork adds support for transferring data to isochronous USB endpoints on Windows ([WinUSB](https://learn.microsoft.com/en-us/windows-hardware/drivers/usbcon/introduction-to-winusb-for-developers))
+
+Constraints on new transfer methods are defined by trait bounds for EndpointType and EndpointDirection.
+
+### Original description below
+
 nusb
 ----
 

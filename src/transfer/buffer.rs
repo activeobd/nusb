@@ -1,6 +1,8 @@
 use std::{
     fmt::Debug,
     mem::{ManuallyDrop, MaybeUninit},
+    ffi::c_void,
+    ptr::null_mut,
     ops::{Deref, DerefMut},
 };
 
@@ -42,6 +44,9 @@ pub struct Buffer {
 
     /// Whether the system allocator or a special allocator was used
     pub(crate) allocator: Allocator,
+
+    #[cfg(target_os = "windows")]
+    pub(crate) os_handle: *const c_void,
 }
 
 impl Buffer {
@@ -66,6 +71,8 @@ impl Buffer {
             requested_len: len_u32,
             capacity: vec.capacity().try_into().expect("capacity overflow"),
             allocator: Allocator::Default,
+            #[cfg(target_os = "windows")]
+            os_handle: null_mut(),
         }
     }
 
@@ -216,6 +223,8 @@ impl From<Vec<u8>> for Buffer {
             requested_len: vec.len().try_into().expect("len overflow"),
             capacity: vec.capacity().try_into().expect("capacity overflow"),
             allocator: Allocator::Default,
+            #[cfg(target_os = "windows")]
+            os_handle: null_mut(),
         }
     }
 }
@@ -232,6 +241,8 @@ impl From<Vec<MaybeUninit<u8>>> for Buffer {
             requested_len: vec.len().try_into().expect("len overflow"),
             capacity: vec.capacity().try_into().expect("capacity overflow"),
             allocator: Allocator::Default,
+            #[cfg(target_os = "windows")]
+            os_handle: null_mut(),
         }
     }
 }

@@ -17,9 +17,10 @@ use log::{debug, error, warn};
 use windows_sys::Win32::{
     Devices::Usb::{
         self, WinUsb_ControlTransfer, WinUsb_Free, WinUsb_GetAssociatedInterface,
-        WinUsb_Initialize, WinUsb_ReadPipe, WinUsb_ResetPipe, WinUsb_SetCurrentAlternateSetting,
-        WinUsb_SetPipePolicy, WinUsb_WritePipe, USB_DEVICE_DESCRIPTOR, WINUSB_INTERFACE_HANDLE,
-        WINUSB_SETUP_PACKET,
+        WinUsb_Initialize, WinUsb_ReadIsochPipeAsap, WinUsb_ReadPipe, WinUsb_RegisterIsochBuffer,
+        WinUsb_ResetPipe, WinUsb_SetCurrentAlternateSetting, WinUsb_SetPipePolicy,
+        WinUsb_UnregisterIsochBuffer, WinUsb_WriteIsochPipeAsap, WinUsb_WritePipe, USBD_ISO_PACKET_DESCRIPTOR,
+        USB_DEVICE_DESCRIPTOR, WINUSB_INTERFACE_HANDLE, WINUSB_SETUP_PACKET,
     },
     Foundation::{
         GetLastError, ERROR_BAD_COMMAND, ERROR_DEVICE_NOT_CONNECTED, ERROR_FILE_NOT_FOUND,
@@ -30,19 +31,13 @@ use windows_sys::Win32::{
 };
 
 use crate::{
-    bitset::EndpointBitSet,
-    descriptors::{
-        ConfigurationDescriptor, DeviceDescriptor, EndpointDescriptor, DESCRIPTOR_LEN_DEVICE,
-        DESCRIPTOR_TYPE_CONFIGURATION,
-    },
-    maybe_future::{blocking::Blocking, Ready},
-    transfer::{
-        internal::{
-            notify_completion, take_completed_from_queue, Idle, Notify, Pending, TransferFuture,
-        },
-        Buffer, Completion, ControlIn, ControlOut, Direction, Recipient, TransferError,
-    },
-    DeviceInfo, Error, ErrorKind, MaybeFuture, Speed,
+    DeviceInfo, Error, ErrorKind, MaybeFuture, Speed, bitset::EndpointBitSet, descriptors::{
+        ConfigurationDescriptor, DESCRIPTOR_LEN_DEVICE, DESCRIPTOR_TYPE_CONFIGURATION, DeviceDescriptor, EndpointDescriptor, TransferType
+    }, maybe_future::{Ready, blocking::Blocking}, transfer::{
+        Buffer, Completion, ControlIn, ControlOut, Direction, Recipient, TransferError, internal::{
+            Idle, Notify, Pending, TransferFuture, notify_completion, take_completed_from_queue
+        }
+    }
 };
 
 use super::{
@@ -430,7 +425,7 @@ impl WindowsInterface {
         data: ControlIn,
         timeout: Duration,
     ) -> impl MaybeFuture<Output = Result<Vec<u8>, TransferError>> {
-        let mut t = TransferData::new(0x80);
+        let mut t = TransferData::new(0x80, None);
         t.set_buffer(Buffer::new(data.length as usize));
 
         let pkt = WINUSB_SETUP_PACKET {
@@ -455,7 +450,7 @@ impl WindowsInterface {
         data: ControlOut,
         timeout: Duration,
     ) -> impl MaybeFuture<Output = Result<(), TransferError>> {
-        let mut t = TransferData::new(0x00);
+        let mut t = TransferData::new(0x00, None);
         t.set_buffer(Buffer::from(data.data.to_vec()));
 
         let pkt = WINUSB_SETUP_PACKET {
@@ -526,19 +521,22 @@ impl WindowsInterface {
         }
         state.endpoints.set(address);
 
-        if Direction::from_address(address) == Direction::In {
-            unsafe {
-                let enable: u8 = 1;
-                let r = WinUsb_SetPipePolicy(
-                    self.winusb_handle,
-                    address,
-                    Usb::RAW_IO,
-                    size_of_val(&enable) as u32,
-                    &enable as *const _ as *const c_void,
-                );
-                if r != TRUE {
-                    let err = GetLastError();
-                    warn!("Failed to enable RAW_IO on endpoint {address:02X}: error {err:x}",);
+        // Isochronous endpoint doesn't support RAW I/O
+        if descriptor.transfer_type() != TransferType::Isochronous {
+            if Direction::from_address(address) == Direction::In  {
+                unsafe {
+                    let enable: u8 = 1;
+                    let r = WinUsb_SetPipePolicy(
+                        self.winusb_handle,
+                        address,
+                        Usb::RAW_IO,
+                        size_of_val(&enable) as u32,
+                        &enable as *const _ as *const c_void,
+                    );
+                    if r != TRUE {
+                        let err = GetLastError();
+                        warn!("Failed to enable RAW_IO on endpoint {address:02X}: error {err:x}",);
+                    }
                 }
             }
         }
@@ -552,6 +550,8 @@ impl WindowsInterface {
             max_packet_size,
             pending: VecDeque::new(),
             idle_transfer: None,
+            isoch_os_handle_list: vec![].into(),
+            isoch_first_sent: false,
         })
     }
 
@@ -587,6 +587,119 @@ impl WindowsInterface {
                     ptr as *mut OVERLAPPED,
                 ),
             }
+        };
+
+        self.post_submit(r, t)
+    }
+
+    fn register_isoch_buffer(&self, ep_address: u8, buf: &Buffer) ->  Result<IsochOSBufferHandle, Error> {
+        let register_result = unsafe {
+            // register within WinUSB
+            let mut h = ptr::null_mut();
+            let r = WinUsb_RegisterIsochBuffer(
+                self.winusb_handle,
+                ep_address,
+                buf.ptr,
+                buf.requested_len,
+                &mut h,
+            );
+
+            if r == TRUE {
+                debug!("Registered isochronous buffer with handle {:p}", h);
+                Ok(IsochOSBufferHandle(h))
+            } else {
+                Err(Error::new_os(ErrorKind::Other, "failed to register isochronous buffer", GetLastError()))
+            }
+        };
+
+        register_result
+    }
+
+    fn unregister_isoch_buffer(&self, os_handle: IsochOSBufferHandle) -> Result<(), Error> {
+        let unregister_result = unsafe {
+            // unregister within WinUSB
+            let r = WinUsb_UnregisterIsochBuffer(os_handle.0);
+
+            if r == TRUE {
+                debug!("Unregistered isochronous buffer with handle {:p}", os_handle.0);
+                Ok(())
+            } else {
+                Err(Error::new_os(ErrorKind::Other, "failed to unregister isochronous buffer", GetLastError()))
+            }
+        };
+
+        unregister_result
+    }
+
+    fn submit_isoch(&self, mut t: Idle<TransferData>, first: bool) -> Pending<TransferData> {
+        let endpoint = t.endpoint;
+        let dir = Direction::from_address(endpoint);
+        let len = t.request_len;
+        let isoch_os_handle = t.isoch_os_handle;
+        assert!(!isoch_os_handle.is_null());
+
+        // !bool -> OS BOOL
+        let continue_stream = match first {
+            true => FALSE,
+            false => TRUE,
+        };
+
+        t.overlapped.InternalHigh = 0;
+        t.error_from_submit = Ok(());
+
+        let t = t.pre_submit();
+        let ptr = t.as_ptr();
+
+        let r = match dir {
+            Direction::In => {
+                unsafe {
+                    let transfer = ptr.as_mut().expect("transfer data is null");
+                    let isoch_in_packets_num = transfer.isoch_in_packets_num.expect("isoch packets number is missing");
+
+                    debug!("Isoch IN transfer {ptr:?} on endpoint {endpoint:02X} for {len} bytes ({isoch_in_packets_num} packets, cont:{continue_stream}); buffer handle: {isoch_os_handle:?}");
+
+                    // initialize packets structure
+                    let packet_stride = (transfer.request_len as usize)
+                        .checked_div(isoch_in_packets_num)
+                        .expect("isoch_in_packets_num is zero") as u32;
+
+                    for (i, slot) in transfer.isoch_packet_descriptors.iter_mut().enumerate() {
+                        slot.write(USBD_ISO_PACKET_DESCRIPTOR {
+                            Offset: packet_stride * i as u32,
+                            Length: 0, // filled by WinUSB on read
+                            Status: 0, // filled by WinUSB on read
+                        });
+                    }
+
+                    let iso_read_packet_ptr = transfer
+                        .isoch_packet_descriptors
+                        .as_mut_ptr()
+                        .cast::<USBD_ISO_PACKET_DESCRIPTOR>();
+
+                    WinUsb_ReadIsochPipeAsap(
+                        isoch_os_handle,
+                        0, // no offset
+                        len,
+                        continue_stream, // [in] ContinueStream Indicates that the transfer should only be submitted if it can be scheduled in the first frame after the last pending transfer
+                        isoch_in_packets_num as u32,
+                        iso_read_packet_ptr as *mut USBD_ISO_PACKET_DESCRIPTOR,
+                        ptr as *mut OVERLAPPED,
+                    )
+                }
+            },
+            Direction::Out => {
+                unsafe {
+                    debug!("Isoch OUT transfer {ptr:?} on endpoint {endpoint:02X} for {len} bytes (cont:{continue_stream}); buffer handle: {isoch_os_handle:?}");
+
+                    WinUsb_WriteIsochPipeAsap(
+                        isoch_os_handle,
+                        0, // no offset
+                        len,
+                        continue_stream, // [in] ContinueStream Indicates that the transfer should only be submitted if it can be scheduled in the first frame after the last pending transfer
+                        ptr as *mut OVERLAPPED,
+                    )
+                }
+            },
         };
 
         self.post_submit(r, t)
@@ -675,6 +788,14 @@ impl WindowsInterface {
     }
 }
 
+
+// Isochronous OS buffer handle
+#[derive(Copy, Clone)]
+struct IsochOSBufferHandle(*const c_void);
+// OS-assigned handles are opaque (i.e. we never deref them, only pass as arguments to OS calls)
+unsafe impl Send for IsochOSBufferHandle {}
+unsafe impl Sync for IsochOSBufferHandle {}
+
 pub(crate) struct WindowsEndpoint {
     inner: Arc<EndpointInner>,
 
@@ -684,6 +805,12 @@ pub(crate) struct WindowsEndpoint {
     pending: VecDeque<Pending<TransferData>>,
 
     idle_transfer: Option<Idle<TransferData>>,
+
+    /// Isochronous: OS buffer handles created for the endpoint
+    isoch_os_handle_list: Vec<IsochOSBufferHandle>,
+
+    /// Isochronous: First transfer has been already sent
+    isoch_first_sent: bool,
 }
 
 struct EndpointInner {
@@ -701,6 +828,23 @@ impl WindowsEndpoint {
         self.pending.len()
     }
 
+    pub(crate) fn allocate_isoch(&mut self, len: usize) -> Result<Buffer, Error> {
+        // allocate buffer (default allocator)
+        let mut buf = Buffer::new(len);
+
+        // register the buffer for isochronous transfers (once)
+        let os_handle = self.inner.interface.register_isoch_buffer(self.endpoint_address(), &buf)?;
+
+        // add to endpoint's OS buffer handle (copy) list
+        self.isoch_os_handle_list.push(os_handle.clone());
+
+        // save OS-assigned buffer handle into Buffer
+        buf.os_handle = os_handle.0;
+
+        // success
+        Ok(buf)
+    }
+
     pub(crate) fn cancel_all(&mut self) {
         // Cancel transfers in reverse order to ensure subsequent transfers
         // can't complete out of order while we're going through them.
@@ -709,24 +853,39 @@ impl WindowsEndpoint {
         }
     }
 
-    fn make_transfer(&mut self, buffer: Buffer) -> Idle<TransferData> {
+    fn make_transfer(&mut self, buffer: Buffer, isoch_in_packets_num: Option<usize>) -> Idle<TransferData> {
         let mut t = self.idle_transfer.take().unwrap_or_else(|| {
-            Idle::new(self.inner.clone(), TransferData::new(self.inner.address))
+            Idle::new(self.inner.clone(), TransferData::new(self.inner.address, isoch_in_packets_num))
         });
         t.set_buffer(buffer);
         t
     }
 
     pub(crate) fn submit(&mut self, buffer: Buffer) {
-        let t = self.make_transfer(buffer);
+        let t = self.make_transfer(buffer, None);
         let t = self.inner.interface.submit(t);
         self.pending.push_back(t);
     }
 
     pub(crate) fn submit_err(&mut self, buffer: Buffer, err: TransferError) {
-        let mut t = self.make_transfer(buffer);
+        let mut t = self.make_transfer(buffer, None);
         t.error_from_submit = Err(err);
         self.pending.push_back(t.simulate_complete());
+    }
+
+    fn submit_isoch(&mut self, buffer: Buffer, isoch_in_packets_num: Option<usize>) {
+        let t = self.make_transfer(buffer, isoch_in_packets_num);
+        let t = self.inner.interface.submit_isoch(t, !self.isoch_first_sent);
+        self.isoch_first_sent = true;       // set the "first packet was sent" flag
+        self.pending.push_back(t);
+    }
+
+    pub(crate) fn submit_isoch_in(&mut self, buffer: Buffer, in_packets_num: usize) {
+        self.submit_isoch(buffer, Some(in_packets_num));
+    }
+
+    pub(crate) fn submit_isoch_out(&mut self, buffer: Buffer) {
+        self.submit_isoch(buffer, None);
     }
 
     pub(crate) fn poll_next_complete(&mut self, cx: &mut Context) -> Poll<Completion> {
@@ -751,6 +910,7 @@ impl WindowsEndpoint {
     }
 
     pub(crate) fn clear_halt(&mut self) -> impl MaybeFuture<Output = Result<(), Error>> {
+        self.isoch_first_sent = false;      // reset "first sent" status
         let inner = self.inner.clone();
         Blocking::new(move || {
             let endpoint = inner.address;
@@ -777,6 +937,13 @@ impl Drop for WindowsEndpoint {
                 self.pending.len()
             );
             self.cancel_all();
+        }
+
+        // unregister isochronous OS buffer handles (if any)
+        for os_handle in self.isoch_os_handle_list.iter() {
+            if let Err(err) =  self.inner.interface.unregister_isoch_buffer(*os_handle) {
+                error!("{err}")
+            }
         }
     }
 }

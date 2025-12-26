@@ -6,7 +6,7 @@ use crate::{
     io::{EndpointRead, EndpointWrite},
     platform,
     transfer::{
-        Buffer, BulkOrInterrupt, Completion, ControlIn, ControlOut, Direction, EndpointDirection,
+        Buffer, BulkOrInterrupt, IsochronousEp, EndpointWithTransfers, Completion, ControlIn, ControlOut, Direction, EndpointDirection,
         EndpointType, In, Out, TransferError,
     },
     ActiveConfigurationError, DeviceInfo, Error, ErrorKind, GetDescriptorError, MaybeFuture, Speed,
@@ -634,6 +634,69 @@ impl<EpType: BulkOrInterrupt> Endpoint<EpType, In> {
     }
 }
 
+/// Common methods for Bulk, Isochronous and Interrupt endpoints.
+impl<EpType: EndpointWithTransfers, Dir: EndpointDirection> Endpoint<EpType, Dir> {
+        /// Return a `Future` that waits for the next pending transfer to complete.
+    ///
+    /// This future is cancel-safe: it can be cancelled and re-created without
+    /// side effects, enabling its use in `select!{}` or similar.
+    ///
+    /// An OUT transfer completes when the specified data has been sent or an
+    /// error occurs. An IN transfer completes when a packet smaller than
+    /// `max_packet_size` is received, the full `requested_len` is received
+    /// (without waiting for or consuming any subsequent zero-length packet), or
+    /// an error occurs.
+    ///
+    /// ## Panics
+    /// * if there are no transfers pending (that is, if [`Self::pending()`]
+    ///   would return 0).
+    pub fn next_complete(&mut self) -> impl Future<Output = Completion> + Send + Sync + '_ {
+        poll_fn(|cx| self.poll_next_complete(cx))
+    }
+
+    /// Poll for a pending transfer completion.
+    ///
+    /// Returns a completed transfer if one is available, or arranges for the
+    /// context's waker to be notified when a transfer completes.
+    ///
+    /// ## Panics
+    ///  * if there are no transfers pending (that is, if [`Self::pending()`]
+    ///    would return 0).
+    pub fn poll_next_complete(&mut self, cx: &mut Context<'_>) -> Poll<Completion> {
+        self.backend.poll_next_complete(cx)
+    }
+
+    /// Wait for a pending transfer completion.
+    ///
+    /// Blocks for up to `timeout` waiting for a transfer to complete, or
+    /// returns `None` if the timeout is reached.
+    ///
+    /// Note that the transfer is not cancelled after the timeout, and can still
+    /// be returned from a subsequent call.
+    ///
+    /// ## Panics
+    ///  * if there are no transfers pending (that is, if [`Self::pending()`]
+    ///    would return 0).
+    pub fn wait_next_complete(&mut self, timeout: Duration) -> Option<Completion> {
+        self.backend.wait_next_complete(timeout)
+    }
+
+    /// Clear the endpoint's halt / stall condition.
+    ///
+    /// Sends a `CLEAR_FEATURE` `ENDPOINT_HALT` control transfer to tell the
+    /// device to reset the endpoint's data toggle and clear the halt / stall
+    /// condition, and resets the host-side data toggle.
+    ///
+    /// Use this after receiving
+    /// [`TransferError::Stall`][crate::transfer::TransferError::Stall] to clear
+    /// the error and resume use of the endpoint.
+    ///
+    /// This should not be called when transfers are pending on the endpoint.
+    pub fn clear_halt(&mut self) -> impl MaybeFuture<Output = Result<(), Error>> {
+        self.backend.clear_halt()
+    }
+}
+
 /// Methods for Bulk and Interrupt endpoints.
 impl<EpType: BulkOrInterrupt, Dir: EndpointDirection> Endpoint<EpType, Dir> {
     /// Allocate a buffer for use on this endpoint, zero-copy if possible.
@@ -693,51 +756,6 @@ impl<EpType: BulkOrInterrupt, Dir: EndpointDirection> Endpoint<EpType, Dir> {
         self.backend.submit(buf)
     }
 
-    /// Return a `Future` that waits for the next pending transfer to complete.
-    ///
-    /// This future is cancel-safe: it can be cancelled and re-created without
-    /// side effects, enabling its use in `select!{}` or similar.
-    ///
-    /// An OUT transfer completes when the specified data has been sent or an
-    /// error occurs. An IN transfer completes when a packet smaller than
-    /// `max_packet_size` is received, the full `requested_len` is received
-    /// (without waiting for or consuming any subsequent zero-length packet), or
-    /// an error occurs.
-    ///
-    /// ## Panics
-    /// * if there are no transfers pending (that is, if [`Self::pending()`]
-    ///   would return 0).
-    pub fn next_complete(&mut self) -> impl Future<Output = Completion> + Send + Sync + '_ {
-        poll_fn(|cx| self.poll_next_complete(cx))
-    }
-
-    /// Poll for a pending transfer completion.
-    ///
-    /// Returns a completed transfer if one is available, or arranges for the
-    /// context's waker to be notified when a transfer completes.
-    ///
-    /// ## Panics
-    ///  * if there are no transfers pending (that is, if [`Self::pending()`]
-    ///    would return 0).
-    pub fn poll_next_complete(&mut self, cx: &mut Context<'_>) -> Poll<Completion> {
-        self.backend.poll_next_complete(cx)
-    }
-
-    /// Wait for a pending transfer completion.
-    ///
-    /// Blocks for up to `timeout` waiting for a transfer to complete, or
-    /// returns `None` if the timeout is reached.
-    ///
-    /// Note that the transfer is not cancelled after the timeout, and can still
-    /// be returned from a subsequent call.
-    ///
-    /// ## Panics
-    ///  * if there are no transfers pending (that is, if [`Self::pending()`]
-    ///    would return 0).
-    pub fn wait_next_complete(&mut self, timeout: Duration) -> Option<Completion> {
-        self.backend.wait_next_complete(timeout)
-    }
-
     /// Submit a single transfer and wait for it to complete.
     ///
     /// This is a convenience method that combines `submit` and
@@ -767,24 +785,61 @@ impl<EpType: BulkOrInterrupt, Dir: EndpointDirection> Endpoint<EpType, Dir> {
             log::warn!("cancelled transfer due to timeout, but it has not yet returned");
         }
     }
+}
 
-    /// Clear the endpoint's halt / stall condition.
-    ///
-    /// Sends a `CLEAR_FEATURE` `ENDPOINT_HALT` control transfer to tell the
-    /// device to reset the endpoint's data toggle and clear the halt / stall
-    /// condition, and resets the host-side data toggle.
-    ///
-    /// Use this after receiving
-    /// [`TransferError::Stall`][crate::transfer::TransferError::Stall] to clear
-    /// the error and resume use of the endpoint.
-    ///
-    /// This should not be called when transfers are pending on the endpoint.
-    pub fn clear_halt(&mut self) -> impl MaybeFuture<Output = Result<(), Error>> {
-        self.backend.clear_halt()
+/// Methods for Isochronous endpoints.
+impl<EpType: IsochronousEp, Dir: EndpointDirection> Endpoint<EpType, Dir> {
+    /// Allocate a buffer for an isochronous transfer on the endpoint.
+    pub fn allocate_isoch(&mut self, len: usize) -> Buffer {
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(b) = self.backend.allocate_isoch(len) {
+                return b;
+            }
+        }
+
+        panic!("Unsupported platform for isochronous endpoint");
     }
 }
 
-impl<EpType: BulkOrInterrupt, Dir: EndpointDirection> Debug for Endpoint<EpType, Dir> {
+/// Methods for Isochronous IN endpoints.
+impl<EpType: IsochronousEp> Endpoint<EpType, In> {
+    /// Begin an isochrounous transfer on the In endpoint.
+    pub fn submit_isoch(&mut self, buf: Buffer, num_iso_packets: usize) {
+        #[cfg(target_os = "windows")]
+        {
+            let req_len = buf.requested_len();
+            if req_len == 0 || req_len % self.max_packet_size() != 0 {
+                warn!(
+                    "Submitting transfer with length {req_len} which is not a multiple of max packet size {} on IN endpoint {:02x}",
+                    self.max_packet_size(),
+                    self.endpoint_address(),
+                );
+
+                return self.backend.submit_err(buf, TransferError::InvalidArgument);
+            }
+
+            self.backend.submit_isoch_in(buf, num_iso_packets);
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        panic!("Unsupported platform for isochronous IN endpoint");
+    }
+}
+
+/// Methods for Isochronous Out endpoints.
+impl<EpType: IsochronousEp> Endpoint<EpType, Out> {
+    /// Begin an isochrounous transfer on the Out endpoint.
+    pub fn submit_isoch(&mut self, buf: Buffer) {
+        #[cfg(target_os = "windows")]
+        self.backend.submit_isoch_out(buf);
+
+        #[cfg(not(target_os = "windows"))]
+        panic!("Unsupported platform for isochronous OUT endpoint");
+    }
+}
+
+impl<EpType: EndpointWithTransfers, Dir: EndpointDirection> Debug for Endpoint<EpType, Dir> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Endpoint")
             .field(
@@ -799,7 +854,7 @@ impl<EpType: BulkOrInterrupt, Dir: EndpointDirection> Debug for Endpoint<EpType,
 
 #[test]
 fn assert_send_sync() {
-    use crate::transfer::{Bulk, In, Interrupt, Out};
+    use crate::transfer::{Bulk, In, Interrupt, Isochronous, Out};
 
     fn require_send_sync<T: Send + Sync>() {}
     require_send_sync::<Interface>();
@@ -808,4 +863,6 @@ fn assert_send_sync() {
     require_send_sync::<Endpoint<Bulk, Out>>();
     require_send_sync::<Endpoint<Interrupt, In>>();
     require_send_sync::<Endpoint<Interrupt, Out>>();
+    require_send_sync::<Endpoint<Isochronous, In>>();
+    require_send_sync::<Endpoint<Isochronous, Out>>();
 }

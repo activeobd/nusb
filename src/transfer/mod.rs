@@ -113,8 +113,14 @@ pub trait EndpointType: private::Sealed + Send + Sync + Unpin {
     const TYPE: TransferType;
 }
 
+/// Endpoint supporting transfers (Bulk, Isochronous or Interrupt)
+pub trait EndpointWithTransfers: EndpointType {}
+
 /// EndpointType for Bulk and interrupt endpoints.
-pub trait BulkOrInterrupt: EndpointType {}
+pub trait BulkOrInterrupt: EndpointWithTransfers {}
+
+/// EndpointType for Isochronous endpoints
+pub trait IsochronousEp: EndpointWithTransfers {}
 
 /// Type-level endpoint type: Bulk
 pub enum Bulk {}
@@ -122,7 +128,17 @@ impl private::Sealed for Bulk {}
 impl EndpointType for Bulk {
     const TYPE: TransferType = TransferType::Bulk;
 }
+impl EndpointWithTransfers for Bulk {}
 impl BulkOrInterrupt for Bulk {}
+
+/// Type-level endpoint type: Isochronous
+pub enum Isochronous {}
+impl private::Sealed for Isochronous {}
+impl EndpointType for Isochronous {
+    const TYPE: TransferType = TransferType::Isochronous;
+}
+impl EndpointWithTransfers for Isochronous {}
+impl IsochronousEp for Isochronous {}
 
 /// Type-level endpoint type: Interrupt
 pub enum Interrupt {}
@@ -130,7 +146,18 @@ impl private::Sealed for Interrupt {}
 impl EndpointType for Interrupt {
     const TYPE: TransferType = TransferType::Interrupt;
 }
+impl EndpointWithTransfers for Interrupt {}
 impl BulkOrInterrupt for Interrupt {}
+
+/// Isochronous IN (read) transfer packet descriptor (for data stored in the buffer)
+#[derive(Debug)]
+pub struct IsochBufferPacketDescriptor {
+    /// Specifies the offset, in bytes, of the buffer for this packet from the beginning of the entire isochronous transfer buffer.
+    pub offset: usize,
+
+    /// The actual number of bytes received from the device
+    pub length: usize,
+}
 
 /// A completed transfer returned from [`Endpoint::next_complete`][`crate::Endpoint::next_complete`].
 ///
@@ -147,6 +174,9 @@ pub struct Completion {
 
     /// Status of the transfer.
     pub status: Result<(), TransferError>,
+
+    /// Isochronous: IN (read) transfer sub-packet descriptors
+    pub isoch_packets_list: Option<Vec<IsochBufferPacketDescriptor>>,
 }
 
 impl Completion {
